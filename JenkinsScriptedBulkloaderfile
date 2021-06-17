@@ -1,0 +1,289 @@
+def createDeploymentInstances(environment, appName, dateNowLongFormat) {
+    withCredentials([usernamePassword(credentialsId: 'db-acc-cre', passwordVariable: 'DB_CRED_P', usernameVariable: 'DB_CRED_U')]) {
+        withEnv(["ENV=${environment}","APP_NAME=${appName}","DATE_LONG=${dateNowLongFormat}","DB_U=${DB_CRED_U}","DB_P=${DB_CRED_P}","BUILD_NUM=${BUILD_NUMBER}"]) {
+            return powershell(label: 'Create & deploy instances', returnStatus: true, script: '''     
+				$ErrorActionPreference = "Stop"			
+                
+				$t = [ordered]@{1='I';2='II';3='III';4='IV';5='V';6='VI';7='VII';8='VIII';9='IX';10='X'}
+				$serverIds = @{'DEV'='SVR11631';'ITG'='SVR08095';'ITG2'='SVR11620';'PRO'='SVR6563'}
+				$deployServers = @{'DEV'='c4w11631.itcs.hpecorp.net';'ITG'='c4w08095.itcs.hpecorp.net';'ITG2'='c4w11620.itcs.hpecorp.net';'PRO'='gvw6563.americas.hpqcorp.net'}
+                $instancesNo = @{
+								'DEV'=@{'AutomatedRecovery'=1; 'Preprocessor'=4;'BulkLoader'=4;'Postprocessor'=1};
+								'ITG'=@{'AutomatedRecovery'=1; 'Preprocessor'=4;'BulkLoader'=4;'Postprocessor'=1};
+								'ITG2'=@{'AutomatedRecovery'=1; 'Preprocessor'=4;'BulkLoader'=4;'Postprocessor'=1};
+								'PRO'=@{'AutomatedRecovery'=1; 'Preprocessor'=8;'BulkLoader'=40;'Postprocessor'=1}
+								}
+								
+				$NoOfInstance = $instancesNo.$env:ENV[$env:APP_NAME]
+				$ApplicationName = "HP.ERMS." + $env:APP_NAME
+                $ServiceNameBase = $ApplicationName.ToUpper()				
+				$ServerId = $serverIds[$env:ENV]  
+				$DeployServer = $deployServers[$env:ENV]  
+				
+				if ($env:ENV -eq 'PRO') {
+					$DestPathBase = "\\\\$DeployServer\\f\$"
+				}
+				else {
+					$DestPathBase = "\\\\$DeployServer\\e\$"	
+				}
+				$DestPathBase = "$DestPathBase\\Program Files\\Hewlett-Packard"
+								
+                Write-Host "Processing for: '$env:ENV' '$env:APP_NAME' '$ServerId' $($NoOfInstance) '$DeployServer'"
+				
+                try {
+                    For ($i = 1; $i -le $NoOfInstance; $i++) {
+                        # get number in Roman
+                        $num = $i
+                        if ($i -gt 10) {
+                            $s = $num.ToString()
+                            $LastDigit = [int]$s.Substring(1,1)
+                            $f = $num - $LastDigit
+                            $roman = "X" * [int]$s.Substring(0,1)
+                            if ($LastDigit -gt 0) {
+                                $roman = $roman + $t[$LastDigit-1]  
+                            }
+                        }
+                        else {
+                            $roman = $t[$num-1]
+                        }
+                        
+                        # Copy all base deployment files to instances' folder
+                        $InstanceSourcePath = "$env:WORKSPACE\\source\\$env:APP_NAME\\bin-$env:ENV\\*.*"
+                        if ($env:APP_NAME -eq 'AutomatedRecovery') {
+                            $InstanceServiceName = $ServiceNameBase
+                        }
+                        else {
+                            $InstanceServiceName = "$ServiceNameBase.$roman"
+                        }
+                        
+                        $InstanceFolderName = "$env:WORKSPACE\\deploy\\$InstanceServiceName"                        
+                        New-Item -Path $InstanceFolderName -ItemType Directory
+                        Copy-Item -Path $InstanceSourcePath -Destination $InstanceFolderName -Recurse
+                        
+                        if ($env:APP_NAME -eq 'AutomatedRecovery') {
+                            # Replace server id and DB acc credentials in config file 
+                            $AppConfigFileName = "$InstanceFolderName\\$ApplicationName.exe.config"
+                            $UsernameToSearch = "uid="
+                            $UsernameToReplace = "$UsernameToSearch$env:DB_U"
+                            $PasswordToSearch = "pwd="
+                            $PasswordToReplace = "$PasswordToSearch$env:DB_P"
+                            (Get-Content -path $AppConfigFileName -Raw) | Foreach-Object {
+                                $_ -replace $UsernameToSearch, $UsernameToReplace `
+                                -replace $PasswordToSearch, $PasswordToReplace
+                            } | Set-Content -Path $AppConfigFileName
+                        }
+                        else {
+                            # rename exe name
+                            $ExeFileName = "$InstanceFolderName\\$ApplicationName.exe"
+                            $ExeFileNameToRename = "$InstanceFolderName\\$ApplicationName.$roman.exe"
+                            Rename-Item -Path $ExeFileName -NewName $ExeFileNameToRename
+                            
+                            # rename exe config name
+                            $AppConfigFileName = "$InstanceFolderName\\$ApplicationName.exe.config"
+                            $AppConfigFileNameToRename = "$InstanceFolderName\\$ApplicationName.$roman.exe.config"
+                            Rename-Item -Path $AppConfigFileName -NewName $AppConfigFileNameToRename
+
+                            # Replace server id and DB acc credentials in config file    
+                            $ServerIdToReplace = "$ServerId" + "_" + $($num)
+                            $UsernameToSearch = "uid="
+                            $UsernameToReplace = "$UsernameToSearch$env:DB_U"
+                            $PasswordToSearch = "pwd="
+                            $PasswordToReplace = "$PasswordToSearch$env:DB_P"
+                            (Get-Content -path $AppConfigFileNameToRename -Raw) | Foreach-Object {
+                                $_ -replace $ServerId, $ServerIdToReplace `
+                                -replace $UsernameToSearch, $UsernameToReplace `
+                                -replace $PasswordToSearch, $PasswordToReplace
+                            } | Set-Content -Path $AppConfigFileNameToRename
+                            
+                            # Replace server id, instance text and DB Acc credentials in log4net
+                            $Log4NetFileName = "$InstanceFolderName\\log4net.config"
+                            $InstanceNameToReplace = "$ApplicationName.$roman"
+                            $UsernameToSearch = "User ID="
+                            $UsernameToReplace = "$UsernameToSearch$env:DB_U"
+                            $PasswordToSearch = "Password="
+                            $PasswordToReplace = "$PasswordToSearch$env:DB_P"
+                            (Get-Content -path $Log4NetFileName -Raw) | Foreach-Object {
+                                $_ -replace $ServerId, $ServerIdToReplace `
+                                -replace $ApplicationName, $InstanceNameToReplace `
+                                -replace $UsernameToSearch, $UsernameToReplace `
+                                -replace $PasswordToSearch, $PasswordToReplace
+                            } | Set-Content -Path $Log4NetFileName
+                        }
+                                                
+                        
+						# Stop service if service is started
+						Get-Service -Name $InstanceServiceName -ComputerName $DeployServer | Where {$_.status -eq 'Running'} |  Stop-Service
+						$svc = Get-Service -Name $InstanceServiceName -ComputerName $DeployServer
+						while($svc.Status -ne 'Stopped')
+						{
+						   Start-Sleep -Seconds 5
+						}
+						Write-Host "[$InstanceServiceName] Service is $($svc.Status)"
+                        Start-Sleep -Seconds 5
+						
+						# Create Backup Folder if not exist							
+						$DeployBackupPath = "$DestPathBase\\BulkLoaderPlatform - Backup - $env:DATE_LONG"
+						if (!(Test-Path -Path $DeployBackupPath)) {
+							New-Item -Path $DeployBackupPath -ItemType Directory
+							Write-Host "[$InstanceServiceName] Created backup folder - $DeployBackupPath"
+						}
+						
+						Start-Sleep -Seconds 3
+						
+						# Move old files to backup folder							
+						$SourcePath = "$DestPathBase\\$InstanceServiceName"
+						Move-Item -Path $SourcePath -Destination $DeployBackupPath -Force
+						Write-Host "[$InstanceServiceName] Moved $SourcePath to backup folder"
+						
+						# Move deployment files
+						Move-Item -Path $InstanceFolderName -Destination $SourcePath
+						Write-Host "[$InstanceServiceName] Deployed $InstanceFolderName to $SourcePath"
+						
+						# Start service
+						Get-Service -Name $InstanceServiceName -ComputerName $DeployServer | Set-Service -Status Running
+						$svc = Get-Service -Name $InstanceServiceName -ComputerName $DeployServer
+						while($svc.Status -ne 'Running')
+						{
+						   Start-Sleep -Seconds 1
+						}
+						Write-Host "[$InstanceServiceName] Service $InstanceServiceName is $($svc.Status)"
+                    }
+                }
+                catch {
+                    Write-Output "Ran into an issue: $PSItem"
+					exit 1
+                }
+            ''')
+        }
+    }
+}
+
+def buildAndDeployFalloutReport(config, appName, buildPath, dateNowLongFormat) {
+	withEnv(["ENV=${config}","WS=${WORKSPACE}","APP_NAME=${appName}","DATE_LONG=${dateNowLongFormat}","BUILD_PATH=${buildPath}","BUILD_NUM=${BUILD_NUMBER}"]) {
+		return powershell(label: 'Build Fallout Report', returnStatus: true, script: '''
+		    $ErrorActionPreference = "Stop"		
+			$SourcePath = "$env:WS\\source\\Reports\\$env:APP_NAME"
+				
+			try {				
+    			# rename config file
+    			$ConfigFile = "$SourcePath\\config.$env:ENV.psd1"
+    			$ConfigFileToRename = "$SourcePath\\config.psd1"
+    			Rename-Item -Path $ConfigFile -NewName $ConfigFileToRename
+    			Write-Host "Renamed $ConfigFile to $ConfigFileToRename"
+    			
+    			# copy files to deploy folder
+    			$PSFileName = "$SourcePath\\GenerateFalloutReport.ps1"
+    			New-Item -Path $env:BUILD_PATH -ItemType Directory
+    			Copy-Item -Path $ConfigFileToRename,$PSFileName -Destination $env:BUILD_PATH
+    
+    			if ($env:ENV -eq 'PRO') {						
+    				$Server = "gvw6564.houston.hpecorp.net"
+    			}
+    			elseif ($env:ENV -eq 'ITG2') {
+					$Server = "c4w12028.itcs.hpecorp.net"	
+				}
+				elseif ($env:ENV -eq 'ITG') {
+					$Server = "g9w8367.houston.hpecorp.net"   
+				}
+				else {
+					$Server = "c4w11653.itcs.hpecorp.net"
+				}
+				$DestPath = "\\\\$Server\\e\$\\Program Files\\Hewlett-Packard\\$env:APP_NAME"
+				
+				# Backup by rename existing web folder
+				while((Test-Path -Path $DestPath)) {
+					$BackupFolderPath = "$DestPath - Backup - $env:DATE_LONG"
+					Rename-Item -Path $DestPath -NewName $BackupFolderPath -ErrorAction Ignore
+					Start-Sleep -Seconds 1
+				}
+				Write-Host "Renamed $DestPath to $BackupFolderPath"
+				
+				# Copy deployment files to server
+				Copy-Item -Path $env:BUILD_PATH -Destination $DestPath -Recurse
+				Write-Host "Deployed $env:BUILD_PATH to $DestPath"
+			}
+			catch {
+                Write-Output "Ran into an issue: $PSItem"
+				exit 1
+            }
+				
+		''')
+	}
+}
+
+node {
+    def config = ''
+	def dateNowLongFormat = new Date().format("yyyy-MM-dd hhmmss")
+
+    try {
+        if (BRANCH_NAME.equals("master")) {
+            config = 'PRO'
+        }    
+        else if (BRANCH_NAME.equalsIgnoreCase("ITG2")) {
+            config = 'ITG2'
+        }
+        else if (BRANCH_NAME.equalsIgnoreCase("ITG")) {
+            config = 'ITG'    
+        }    
+        else { 
+            config = 'DEV'
+        }
+		
+        stage('Prepare') {
+            // delete old source folder 
+            dir('source') {
+                deleteDir()
+            } 
+            dir('deploy') {
+                deleteDir()
+            }
+            checkout([
+                $class: 'GitSCM', 
+                branches: [[name: "*/${BRANCH_NAME}"]], 
+                extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'source']],
+                userRemoteConfigs: [[credentialsId: 'PAT', url: "https://github.hpe.com/hpe/ERMSBulkLoaderPlatform"]]])   
+        }
+        
+        stage('Fallout Report') {
+			def appName = "Fallout Report"
+			def buildPath = "${WORKSPACE}\\deploy\\Reports\\${appName}"
+            if (buildAndDeployFalloutReport(config, appName, buildPath, dateNowLongFormat) != 0) {
+                throw new Exception("Error while deploying Fallout Report");
+            }
+        }
+        
+        
+        stage('Build BLPlatform') {
+            // Restore, clean, and build the solution
+            def msbHome = tool name: 'MSBuild', type: 'hudson.plugins.msbuild.MsBuildInstallation'
+			def slnName = "${WORKSPACE}\\source\\BulkLoaderPlatform.sln"
+            bat("\"${msbHome}\" \"${slnName}\" /p:Configuration=${config} /verbosity:minimal /nologo /t:Restore,Clean,Build")                    
+        }
+        
+        stage('Create instances & Deploy BLPlatform') {
+            if (createDeploymentInstances(config, 'AutomatedRecovery', dateNowLongFormat) != 0) {
+                throw new Exception("Error while deploying AutomatedRecovery");
+            }
+            if (createDeploymentInstances(config, 'Preprocessor', dateNowLongFormat) != 0) {
+                throw new Exception("Error while deploying Preprocessor");
+            }
+            if (createDeploymentInstances(config, 'BulkLoader', dateNowLongFormat) != 0) {
+                throw new Exception("Error while deploying BulkLoader");
+            }
+            if (createDeploymentInstances(config, 'Postprocessor', dateNowLongFormat) != 0) {
+                throw new Exception("Error while deploying Postprocessor");
+            }
+        }
+    }
+    catch (err) {
+        echo "Failed: ${err}"
+        currentBuild.result = 'FAILURE'
+        return
+    } 
+    finally {
+        emailext body: '''${SCRIPT, template="groovy-html.template"}''', 
+                 recipientProviders: [requestor()], 
+                 subject: '$PROJECT_NAME - Build # $BUILD_NUMBER - $BUILD_STATUS!',
+                 to: 'ERMSJenkinsAdmin@hpe.com'   
+    }
+}
